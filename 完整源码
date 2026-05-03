@@ -1,0 +1,276 @@
+from enum import Enum
+from queue import Queue
+from threading import Thread, Lock
+from time import sleep
+from datetime import datetime
+from pydantic import BaseModel
+from typing import Optional, Dict, Any, List
+
+# ===================== 1. 全局枚举 & 数据模型 =====================
+class TaskStatus(Enum):
+    PENDING = "待处理"
+    RUNNING = "执行中"
+    SUCCESS = "执行成功"
+    FAILED = "执行失败"
+    REJECT = "风控拦截"
+
+class TaskType(Enum):
+    CONTENT_CREATE = "内容创作"
+    DATA_MONITOR = "数据监测"
+    RISK_AUDIT = "风控审核"
+    OP_PUBLISH = "运营发布"
+
+class OpTask(BaseModel):
+    task_id: str
+    task_type: TaskType
+    content: str
+    status: TaskStatus = TaskStatus.PENDING
+    result: Optional[str] = None
+    create_time: str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ===================== 2. 基础Agent父类 =====================
+class BaseAgent:
+    def __init__(self, name: str, task_queue: Queue, agent_registry: Dict[str, Any]):
+        self.name = name
+        self.task_queue = task_queue
+        self.agent_registry = agent_registry
+        self.running = False
+        self.lock = Lock()
+
+    def run(self):
+        self.running = True
+        Thread(target=self._loop, daemon=True).start()
+        print(f"✅ 【{self.name}】启动成功")
+
+    def stop(self):
+        self.running = False
+        print(f"❌ 【{self.name}】已停止")
+
+    def _loop(self):
+        while self.running:
+            try:
+                if not self.task_queue.empty():
+                    task = self.task_queue.get()
+                    self.handle_task(task)
+                sleep(0.5)
+            except Exception as e:
+                print(f"⚠️ 【{self.name}】任务异常: {str(e)}")
+
+    def handle_task(self, task: OpTask):
+        """子类重写该方法实现业务逻辑"""
+        pass
+
+# ===================== 3. 各业务Agent实现 =====================
+# 3.1 调度中心Agent
+class ScheduleAgent(BaseAgent):
+    def __init__(self, name: str, task_queue: Queue, agent_registry: Dict[str, Any]):
+        super().__init__(name, task_queue, agent_registry)
+        self.task_list: List[OpTask] = []
+
+    def add_task(self, task: OpTask):
+        """外部提交任务入口"""
+        self.task_queue.put(task)
+        with self.lock:
+            self.task_list.append(task)
+        print(f"📥 调度中心接收任务: {task.task_id} 类型:{task.task_type.value}")
+
+    def handle_task(self, task: OpTask):
+        # 根据任务类型分发给对应Agent
+        task.status = TaskStatus.RUNNING
+        if task.task_type == TaskType.CONTENT_CREATE:
+            self.agent_registry["content_agent"].receive_task(task)
+        elif task.task_type == TaskType.DATA_MONITOR:
+            self.agent_registry["data_agent"].receive_task(task)
+        elif task.task_type == TaskType.RISK_AUDIT:
+            self.agent_registry["risk_agent"].receive_task(task)
+        elif task.task_type == TaskType.OP_PUBLISH:
+            self.agent_registry["publish_agent"].receive_task(task)
+
+    def show_all_task(self):
+        """查看所有任务状态"""
+        print("\n========== 全量任务状态 ==========")
+        for t in self.task_list:
+            print(f"任务ID:{t.task_id} | 类型:{t.task_type.value} | 状态:{t.status.value} | 结果:{t.result}")
+
+# 3.2 内容创作Agent
+class ContentAgent(BaseAgent):
+    def __init__(self, name: str, task_queue: Queue, agent_registry: Dict[str, Any]):
+        super().__init__(name, task_queue, agent_registry)
+        self.agent_task_queue = Queue()
+
+    def receive_task(self, task: OpTask):
+        self.agent_task_queue.put(task)
+
+    def _loop(self):
+        while self.running:
+            if not self.agent_task_queue.empty():
+                task = self.agent_task_queue.get()
+                self.handle_task(task)
+            sleep(0.5)
+
+    def handle_task(self, task: OpTask):
+        print(f"✍️ 内容创作Agent 开始创作: {task.task_id}")
+        # 模拟AI文案生成
+        sleep(1)
+        art_content = f"【自动生成运营文案】主题：{task.content}，标题已优化，正文已排版完成"
+        task.result = art_content
+        task.status = TaskStatus.SUCCESS
+        # 创作完成自动流转到风控审核
+        self.agent_registry["schedule_agent"].add_task(
+            OpTask(
+                task_id=task.task_id,
+                task_type=TaskType.RISK_AUDIT,
+                content=art_content
+            )
+        )
+        print(f"✅ 内容创作完成: {task.task_id}")
+
+# 3.3 风控审核Agent
+class RiskAuditAgent(BaseAgent):
+    def __init__(self, name: str, task_queue: Queue, agent_registry: Dict[str, Any]):
+        super().__init__(name, task_queue, agent_registry)
+        self.agent_task_queue = Queue()
+
+    def receive_task(self, task: OpTask):
+        self.agent_task_queue.put(task)
+
+    def _loop(self):
+        while self.running:
+            if not self.agent_task_queue.empty():
+                task = self.agent_task_queue.get()
+                self.handle_task(task)
+            sleep(0.5)
+
+    def handle_task(self, task: OpTask):
+        print(f"🔍 风控审核Agent 检测内容: {task.task_id}")
+        sleep(1)
+        # 模拟合规检测
+        if "违规" in task.content:
+            task.status = TaskStatus.REJECT
+            task.result = "内容含敏感词，风控拦截"
+            print(f"⛔ 风控拦截任务: {task.task_id}")
+        else:
+            task.status = TaskStatus.SUCCESS
+            task.result = "内容合规，审核通过"
+            # 审核通过流转到运营发布
+            self.agent_registry["schedule_agent"].add_task(
+                OpTask(
+                    task_id=task.task_id,
+                    task_type=TaskType.OP_PUBLISH,
+                    content=task.content
+                )
+            )
+            print(f"✅ 风控审核通过: {task.task_id}")
+
+# 3.4 数据监测Agent
+class DataMonitorAgent(BaseAgent):
+    def __init__(self, name: str, task_queue: Queue, agent_registry: Dict[str, Any]):
+        super().__init__(name, task_queue, agent_registry)
+        self.agent_task_queue = Queue()
+
+    def receive_task(self, task: OpTask):
+        self.agent_task_queue.put(task)
+
+    def _loop(self):
+        while self.running:
+            if not self.agent_task_queue.empty():
+                task = self.agent_task_queue.get()
+                self.handle_task(task)
+            sleep(0.5)
+
+    def handle_task(self, task: OpTask):
+        print(f"📊 数据监测Agent 开始采集: {task.task_id}")
+        sleep(1)
+        # 模拟数据统计
+        task.result = "粉丝增长:236 | 曝光:12580 | 互动率:4.2%"
+        task.status = TaskStatus.SUCCESS
+        print(f"📈 数据采集完成 {task.task_id} => {task.result}")
+
+# 3.5 运营发布Agent
+class PublishAgent(BaseAgent):
+    def __init__(self, name: str, task_queue: Queue, agent_registry: Dict[str, Any]):
+        super().__init__(name, task_queue, agent_registry)
+        self.agent_task_queue = Queue()
+
+    def receive_task(self, task: OpTask):
+        self.agent_task_queue.put(task)
+
+    def _loop(self):
+        while self.running:
+            if not self.agent_task_queue.empty():
+                task = self.agent_task_queue.get()
+                self.handle_task(task)
+            sleep(0.5)
+
+    def handle_task(self, task: OpTask):
+        print(f"🚀 运营发布Agent 开始发布: {task.task_id}")
+        sleep(1)
+        task.result = "已自动发布至公众号/小红书/抖音多平台"
+        task.status = TaskStatus.SUCCESS
+        print(f"🎉 任务全流程完成: {task.task_id}")
+
+# ===================== 4. 系统初始化 & 启动 =====================
+class MultiAgentOpSystem:
+    def __init__(self):
+        self.global_queue = Queue()
+        # 代理注册中心
+        self.agent_registry = {}
+        # 初始化所有Agent
+        self.schedule_agent = ScheduleAgent("调度中心Agent", self.global_queue, self.agent_registry)
+        self.content_agent = ContentAgent("内容创作Agent", self.global_queue, self.agent_registry)
+        self.risk_agent = RiskAuditAgent("风控审核Agent", self.global_queue, self.agent_registry)
+        self.data_agent = DataMonitorAgent("数据监测Agent", self.global_queue, self.agent_registry)
+        self.publish_agent = PublishAgent("运营发布Agent", self.global_queue, self.agent_registry)
+        # 注册到注册表
+        self.agent_registry["schedule_agent"] = self.schedule_agent
+        self.agent_registry["content_agent"] = self.content_agent
+        self.agent_registry["risk_agent"] = self.risk_agent
+        self.agent_registry["data_agent"] = self.data_agent
+        self.agent_registry["publish_agent"] = self.publish_agent
+
+    def start_all_agent(self):
+        """启动所有智能体"""
+        self.schedule_agent.run()
+        self.content_agent.run()
+        self.risk_agent.run()
+        self.data_agent.run()
+        self.publish_agent.run()
+        print("\n========== 多Agent协同运营系统 全部启动完成 ==========\n")
+
+    def submit_op_task(self, task_id: str, task_type: TaskType, content: str):
+        """提交运营任务"""
+        task = OpTask(task_id=task_id, task_type=task_type, content=content)
+        self.schedule_agent.add_task(task)
+
+# ===================== 5. 测试运行 =====================
+if __name__ == "__main__":
+    # 初始化系统
+    system = MultiAgentOpSystem()
+    # 启动所有Agent
+    system.start_all_agent()
+
+    # 测试1：提交内容创作全流程任务
+    system.submit_op_task(
+        task_id="T2025001",
+        task_type=TaskType.CONTENT_CREATE,
+        content="618电商活动推广文案"
+    )
+
+    # 测试2：提交数据监测任务
+    system.submit_op_task(
+        task_id="T2025002",
+        task_type=TaskType.DATA_MONITOR,
+        content="公众号本周数据统计"
+    )
+
+    # 测试3：提交含违规词测试风控拦截
+    system.submit_op_task(
+        task_id="T2025003",
+        task_type=TaskType.CONTENT_CREATE,
+        content="虚假宣传违规引流文案"
+    )
+
+    # 等待任务执行完成
+    sleep(8)
+    # 查看所有任务状态
+    system.schedule_agent.show_all_task()
